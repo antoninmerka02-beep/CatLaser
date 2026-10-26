@@ -1,0 +1,33 @@
+name: CatLaser
+options:
+  bundleIdPrefix: cz.merka
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  CatLaser:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    scheme: {}
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: CatLaser
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen: {}
+        UIApplicationSupportsIndirectInputEvents: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSBluetoothAlwaysUsageDescription: "CatLaser se přes Bluetooth připojuje k laserové hračce a ovládá ji."
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: cz.merka.catlaser
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: NO
