@@ -14,7 +14,7 @@ struct CalibrationData: Codable {
     var date: Date
 }
 
-/// Cat state in laser coordinates.
+/// Tracked target (cat or person) in laser coordinates.
 struct CatState {
     var position: CGPoint      // ground point (bottom centre of the box) in laser units
     var velocity: CGPoint      // laser units / s
@@ -27,7 +27,10 @@ struct CatState {
 
 final class FieldModel: ObservableObject {
     @Published private(set) var calibration: CalibrationData?
-    @Published var fence: [CGPoint] = [] { didSet { saveFence() } }
+    /// Hard limits of the laser itself (laser coordinates). Nothing is ever sent outside.
+    @Published var limits: [CGPoint] = [] { didSet { saveLimits() } }
+    /// Play area drawn on the camera image (normalised camera coordinates, per lens).
+    @Published var fenceCam: [CGPoint] = [] { didSet { saveFence() } }
     @Published var editingFence = false
     @Published private(set) var cat: CatState?
 
@@ -36,22 +39,29 @@ final class FieldModel: ObservableObject {
     @Published var calibrationProgress: Double = 0
     @Published var calibrationStatus = ""
     @Published var lastDotCam: CGPoint?
+    @Published var calibrationDots: [CGPoint] = []
+    var cancelRequested = false
 
     private(set) var laserToCam: Homography?
+    private(set) var fenceLaser: [CGPoint] = []
     private var lens: CameraLens = .standard
+    private var loadingFence = false
     private var cancellables = Set<AnyCancellable>()
 
-    static let margin: CGFloat = 12
+    static let margin: CGFloat = 10
 
     init(camera: CameraManager) {
         lens = camera.lens
-        loadFence()
+        loadLimits()
         loadCalibration()
+        loadFence()
         camera.$lens
             .removeDuplicates()
             .sink { [weak self] l in
-                self?.lens = l
-                self?.loadCalibration()
+                guard let self = self, l != self.lens else { return }
+                self.lens = l
+                self.loadCalibration()
+                self.loadFence()
             }
             .store(in: &cancellables)
         camera.$detection
@@ -61,6 +71,7 @@ final class FieldModel: ObservableObject {
     }
 
     var isCalibrated: Bool { calibration != nil }
+    var hasLimits: Bool { limits.count >= 3 }
 
     // MARK: - Coordinate conversion
 
@@ -75,17 +86,19 @@ final class FieldModel: ObservableObject {
 
     // MARK: - Play field
 
-    /// Polygons the dot must stay inside (reachable area, plus the fence if set).
+    /// Polygons the dot must stay inside: laser limits, calibrated reach and the drawn play area.
     var playPolygons: [[CGPoint]] {
         var polys: [[CGPoint]] = []
+        if limits.count >= 3 { polys.append(limits) }
         if let r = calibration?.reach, r.count >= 3 { polys.append(r) }
-        if fence.count >= 3 { polys.append(fence) }
+        if fenceLaser.count >= 3 { polys.append(fenceLaser) }
         return polys
     }
 
     var playCenter: CGPoint {
-        if fence.count >= 3 { return Poly.centroid(fence) }
+        if fenceLaser.count >= 3 { return Poly.centroid(fenceLaser) }
         if let r = calibration?.reach, r.count >= 3 { return Poly.centroid(r) }
+        if limits.count >= 3 { return Poly.centroid(limits) }
         return CGPoint(x: 200, y: 200)
     }
 
@@ -105,11 +118,17 @@ final class FieldModel: ObservableObject {
             }
             if !moved { break }
         }
-        // Last resort when fence and reach barely overlap: stay inside the fence.
-        if !isInside(q), let last = polys.last {
-            q = Poly.pullInside(last, q, margin: Self.margin)
+        // Laser limits always win.
+        if limits.count >= 3 && !Poly.contains(limits, q) {
+            q = Poly.pullInside(limits, q, margin: Self.margin)
         }
         return q.clamped(0, 400)
+    }
+
+    /// Constrains only to the hard laser limits (used during calibration).
+    func constrainToLimits(_ p: CGPoint) -> CGPoint {
+        guard limits.count >= 3, !Poly.contains(limits, p) else { return p.clamped(0, 400) }
+        return Poly.pullInside(limits, p, margin: 2).clamped(0, 400)
     }
 
     func distanceToEdge(_ p: CGPoint) -> CGFloat {
@@ -131,36 +150,46 @@ final class FieldModel: ObservableObject {
         return best
     }
 
-    // MARK: - Fence editing (input in camera-normalised coordinates)
+    // MARK: - Laser limits (laser coordinates)
+
+    func addLimitPoint(_ p: CGPoint) { limits.append(p.clamped(0, 400)) }
+    func removeLastLimitPoint() { if !limits.isEmpty { limits.removeLast() } }
+    func clearLimits() { limits = [] }
+
+    // MARK: - Play area editing (camera coordinates)
 
     func addFencePoint(cam: CGPoint) {
-        guard let p = camToLaser(cam) else { return }
-        fence.append(p.clamped(-50, 450))
+        fenceCam.append(cam.clamped(0, 1))
     }
 
     func moveFencePoint(_ i: Int, cam: CGPoint) {
-        guard fence.indices.contains(i), let p = camToLaser(cam) else { return }
-        fence[i] = p.clamped(-50, 450)
+        guard fenceCam.indices.contains(i) else { return }
+        fenceCam[i] = cam.clamped(0, 1)
     }
 
     func nearestFenceIndex(cam: CGPoint, maxDistance: CGFloat) -> Int? {
         var best: Int?
         var bestD = maxDistance
-        for (i, p) in fence.enumerated() {
-            guard let c = laserToCamPoint(p) else { continue }
-            let d = c.distance(to: cam)
+        for (i, p) in fenceCam.enumerated() {
+            let d = p.distance(to: cam)
             if d < bestD { bestD = d; best = i }
         }
         return best
     }
 
-    func removeLastFencePoint() {
-        if !fence.isEmpty { fence.removeLast() }
+    func removeLastFencePoint() { if !fenceCam.isEmpty { fenceCam.removeLast() } }
+    func clearFence() { fenceCam = [] }
+
+    private func updateFenceLaser() {
+        if fenceCam.count >= 3, calibration != nil {
+            let pts = fenceCam.compactMap { camToLaser($0) }
+            fenceLaser = pts.count == fenceCam.count ? pts : []
+        } else {
+            fenceLaser = []
+        }
     }
 
-    func clearFence() { fence = [] }
-
-    // MARK: - Cat tracking
+    // MARK: - Target tracking
 
     private func updateCat(_ d: CatDetection) {
         guard calibration != nil else { return }
@@ -169,7 +198,7 @@ final class FieldModel: ObservableObject {
         let bl = camToLaser(CGPoint(x: r.minX, y: r.maxY))
         let br = camToLaser(CGPoint(x: r.maxX, y: r.maxY))
         var size: CGFloat = 40
-        if let a = bl, let b = br { size = max(15, a.distance(to: b)) }
+        if let a = bl, let b = br { size = max(15, min(200, a.distance(to: b))) }
 
         let corners = [CGPoint(x: r.minX, y: r.minY), CGPoint(x: r.maxX, y: r.minY),
                        CGPoint(x: r.maxX, y: r.maxY), CGPoint(x: r.minX, y: r.maxY)]
@@ -194,22 +223,53 @@ final class FieldModel: ObservableObject {
 
     // MARK: - Calibration
 
+    /// Laser points visited during calibration: a grid inside the laser limits.
+    func calibrationTargets() -> [CGPoint] {
+        let poly = limits.count >= 3 ? limits : [CGPoint(x: 20, y: 20), CGPoint(x: 380, y: 20),
+                                                  CGPoint(x: 380, y: 380), CGPoint(x: 20, y: 380)]
+        let xs = poly.map { $0.x }, ys = poly.map { $0.y }
+        guard let minX = xs.min(), let maxX = xs.max(), let minY = ys.min(), let maxY = ys.max() else { return [] }
+        for n in [4, 5, 6] {
+            var pts: [CGPoint] = []
+            for row in 0..<n {
+                let fy = (CGFloat(row) + 0.5) / CGFloat(n)
+                let y = minY + (maxY - minY) * fy
+                var rowPts: [CGPoint] = []
+                for col in 0..<n {
+                    let fx = (CGFloat(col) + 0.5) / CGFloat(n)
+                    let p = CGPoint(x: minX + (maxX - minX) * fx, y: y)
+                    if poly.count < 3 || Poly.contains(poly, p) { rowPts.append(p) }
+                }
+                pts += row % 2 == 0 ? rowPts : Array(rowPts.reversed())
+            }
+            if pts.count >= 12 || n == 6 { return pts }
+        }
+        return []
+    }
+
+    /// Automatic calibration. The laser is NOT switched off (it plays a ~5 s intro after every power-on);
+    /// the dot is found as the difference between frames taken with the dot at neighbouring grid points.
     @MainActor
-    func calibrate(laser: LaserController, camera: CameraManager) async {
+    func calibrate(laser: LaserController, camera: CameraManager,
+                   settle: Double, warmup: Double, exposureBias: Float) async -> Bool {
         guard laser.isReady else {
-            calibrationStatus = "Nejdřív se připoj k laseru (záložka Test)."
-            return
+            calibrationStatus = "Laser není připojený."
+            return false
         }
         guard camera.isRunning else {
             calibrationStatus = "Kamera neběží."
-            return
+            return false
         }
         calibrating = true
+        cancelRequested = false
         calibrationProgress = 0
         lastDotCam = nil
+        calibrationDots = []
         camera.setDetectionEnabled(false)
+        camera.beginDepthLearning()
         defer {
             calibrating = false
+            camera.restoreExposure()
             camera.setDetectionEnabled(true)
         }
 
@@ -217,71 +277,120 @@ final class FieldModel: ObservableObject {
         if laser.preset != 0 { laser.setPreset(0) }
         laser.addLog("Kalibrace: start")
 
-        calibrationStatus = "Snímám pozadí (laser vypnutý)…"
-        laser.setLaser(false)
-        var background = await averaged(camera, delay: 0.7)
-        laser.setLaser(true)
-
-        let coords: [CGFloat] = [40, 147, 253, 360]
-        var targets: [CGPoint] = []
-        for (row, y) in coords.enumerated() {
-            let xs: [CGFloat] = row % 2 == 0 ? coords : Array(coords.reversed())
-            for x in xs { targets.append(CGPoint(x: x, y: y)) }
+        let targets = calibrationTargets()
+        guard targets.count >= 6 else {
+            calibrationStatus = "Limity laseru jsou moc malé."
+            camera.finishDepthLearning()
+            return false
         }
 
-        var camPts: [CGPoint] = []
-        var laserPts: [CGPoint] = []
+        // 1) Laser on + wait for its intro animation.
+        if !laser.laserOn {
+            calibrationStatus = "Zapínám laser – čekám na úvodní kolečko…"
+            laser.setLaser(true)
+            await pause(warmup)
+        }
+        if cancelRequested { return cancelled(camera) }
+
+        // 2) Darker, locked exposure so the dot stands out.
+        calibrationStatus = "Nastavuji expozici…"
+        camera.prepareCalibrationExposure(bias: exposureBias)
+        laser.gameMove(x: Int(targets[0].x), y: Int(targets[0].y))
+        await pause(1.5)
+        camera.lockExposure()
+        await pause(0.4)
+
+        // 3) Visit all points and grab frames.
+        var frames: [RedFrame] = []
         for (i, t) in targets.enumerated() {
-            if i == targets.count / 2 {
-                calibrationStatus = "Obnovuji pozadí…"
-                laser.setLaser(false)
-                background = await averaged(camera, delay: 0.6)
-                laser.setLaser(true)
-            }
+            if cancelRequested { return cancelled(camera) }
             calibrationStatus = "Bod \(i + 1) z \(targets.count)"
             laser.gameMove(x: Int(t.x), y: Int(t.y))
-            let on1 = await camera.grabFrame(after: 0.75)
-            let on2 = await camera.grabFrame(after: 0.05)
-            if let dot = DotDetector.detect(on: [on1, on2], off: background) {
-                camPts.append(dot.point)
-                laserPts.append(t)
-                lastDotCam = dot.point
-                laser.addLog(String(format: "Kalibrace bod %d: laser (%.0f, %.0f) → kamera (%.3f, %.3f), síla %d",
-                                    i + 1, t.x, t.y, dot.point.x, dot.point.y, dot.strength))
-            } else {
-                laser.addLog(String(format: "Kalibrace bod %d (%.0f, %.0f): tečka nenalezena", i + 1, t.x, t.y))
-            }
-            calibrationProgress = Double(i + 1) / Double(targets.count)
+            frames.append(await averagedFrame(camera, delay: settle))
+            calibrationProgress = Double(i + 1) / Double(targets.count) * 0.95
         }
-        laser.gameMove(x: 200, y: 200)
+        laser.gameMove(x: Int(playCenter.x), y: Int(playCenter.y))
+        camera.finishDepthLearning()
+
+        // 4) Find the dot: compare each frame with both neighbours, accept only consistent results.
+        calibrationStatus = "Hledám tečku ve snímcích…"
+        let roi = searchRegion()
+        var camPts: [CGPoint] = []
+        var laserPts: [CGPoint] = []
+        for i in 0..<frames.count {
+            let refs = [i - 1, i + 1].filter { $0 >= 0 && $0 < frames.count }
+            let found = refs.compactMap { DotDetector.detect(on: frames[i], ref: frames[$0], roi: roi) }
+            var accepted: CGPoint?
+            if found.count == 2 {
+                if found[0].point.distance(to: found[1].point) < 0.03 {
+                    accepted = (found[0].point + found[1].point) * 0.5
+                }
+            } else if found.count == 1 && refs.count == 1 && found[0].strength >= DotDetector.minStrength * 2 {
+                accepted = found[0].point
+            }
+            let t = targets[i]
+            if let a = accepted {
+                camPts.append(a)
+                laserPts.append(t)
+                calibrationDots.append(a)
+                lastDotCam = a
+                laser.addLog(String(format: "Bod %d: laser (%.0f, %.0f) → kamera (%.3f, %.3f), síla %d",
+                                    i + 1, t.x, t.y, a.x, a.y, found.map { $0.strength }.max() ?? 0))
+            } else {
+                laser.addLog(String(format: "Bod %d (%.0f, %.0f): tečka nenalezena (%d/%d shod)",
+                                    i + 1, t.x, t.y, found.count, refs.count))
+            }
+        }
+        calibrationProgress = 1
 
         guard camPts.count >= 6 else {
-            calibrationStatus = "Kalibrace selhala: tečka nalezena jen v \(camPts.count) bodech z \(targets.count). Ztlum světlo nebo natoč kameru na plochu, kam laser svítí."
+            calibrationStatus = "Kalibrace selhala: tečka nalezena jen v \(camPts.count) z \(targets.count) bodů. Zkus ztlumit světlo, snížit expozici nebo prodloužit čekání na bod."
             laser.addLog(calibrationStatus)
-            return
+            return false
         }
-
         guard let result = Self.robustFit(cam: camPts, laser: laserPts) else {
-            calibrationStatus = "Kalibrace selhala: body nedávají smysl (kamera se hýbala?)."
+            calibrationStatus = "Kalibrace selhala: body nedávají smysl (pohnul se telefon?)."
             laser.addLog(calibrationStatus)
-            return
+            return false
         }
 
         let data = CalibrationData(camToLaser: result.h, reach: Poly.convexHull(result.inliers),
                                    points: result.inliers.count, rmsError: result.rms, date: Date())
         setCalibration(data)
-        calibrationStatus = String(format: "Hotovo: %d bodů, přesnost ±%.1f (z 400).", data.points, data.rmsError)
-        laser.addLog("Kalibrace: " + calibrationStatus)
+        calibrationStatus = String(format: "Kalibrace OK: %d bodů, přesnost ±%.1f (z 400).", data.points, data.rmsError)
+        laser.addLog(calibrationStatus)
+        return true
     }
 
-    private func averaged(_ camera: CameraManager, delay: Double) async -> RedFrame {
+    private func cancelled(_ camera: CameraManager) -> Bool {
+        calibrationStatus = "Kalibrace zrušena."
+        camera.finishDepthLearning()
+        return false
+    }
+
+    private func pause(_ s: Double) async {
+        try? await Task.sleep(nanoseconds: UInt64(max(0, s) * 1_000_000_000))
+    }
+
+    /// Average of 3 consecutive frames taken `delay` seconds from now.
+    private func averagedFrame(_ camera: CameraManager, delay: Double) async -> RedFrame {
         let a = await camera.grabFrame(after: delay)
-        let b = await camera.grabFrame(after: 0.05)
-        var out = a.data
-        for i in 0..<min(out.count, b.data.count) {
-            out[i] = UInt8((Int(a.data[i]) + Int(b.data[i])) / 2)
+        let b = await camera.grabFrame(after: 0)
+        let c = await camera.grabFrame(after: 0)
+        let n = min(a.data.count, b.data.count, c.data.count)
+        var out = [UInt8](repeating: 0, count: a.data.count)
+        for i in 0..<n {
+            out[i] = UInt8((Int(a.data[i]) + Int(b.data[i]) + Int(c.data[i])) / 3)
         }
-        return RedFrame(width: a.width, height: a.height, data: out, time: b.time)
+        return RedFrame(width: a.width, height: a.height, data: out, time: c.time)
+    }
+
+    /// Where to look for the dot: the drawn play area (+ margin), else the whole frame.
+    private func searchRegion() -> CGRect {
+        guard fenceCam.count >= 3 else { return CGRect(x: 0, y: 0, width: 1, height: 1) }
+        let xs = fenceCam.map { $0.x }, ys = fenceCam.map { $0.y }
+        let r = CGRect(x: xs.min()!, y: ys.min()!, width: xs.max()! - xs.min()!, height: ys.max()! - ys.min()!)
+        return r.insetBy(dx: -0.15, dy: -0.15).intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
     }
 
     /// Fits camera→laser with simple outlier rejection. Laser coords are scaled to 0…1 for stability.
@@ -315,6 +424,7 @@ final class FieldModel: ObservableObject {
     private func setCalibration(_ data: CalibrationData) {
         calibration = data
         laserToCam = data.camToLaser.inverted()
+        updateFenceLaser()
         if let encoded = try? JSONEncoder().encode(data) {
             UserDefaults.standard.set(encoded, forKey: "calibration.\(lens.rawValue)")
         }
@@ -323,6 +433,7 @@ final class FieldModel: ObservableObject {
     func clearCalibration() {
         calibration = nil
         laserToCam = nil
+        updateFenceLaser()
         UserDefaults.standard.removeObject(forKey: "calibration.\(lens.rawValue)")
     }
 
@@ -336,16 +447,34 @@ final class FieldModel: ObservableObject {
             calibration = nil
             laserToCam = nil
         }
+        updateFenceLaser()
     }
 
     private func saveFence() {
-        let arr = fence.map { [Double($0.x), Double($0.y)] }
-        UserDefaults.standard.set(arr, forKey: "fence")
+        updateFenceLaser()
+        guard !loadingFence else { return }
+        let arr = fenceCam.map { [Double($0.x), Double($0.y)] }
+        UserDefaults.standard.set(arr, forKey: "fence.cam.\(lens.rawValue)")
     }
 
     private func loadFence() {
-        if let arr = UserDefaults.standard.array(forKey: "fence") as? [[Double]] {
-            fence = arr.compactMap { $0.count == 2 ? CGPoint(x: $0[0], y: $0[1]) : nil }
+        loadingFence = true
+        if let arr = UserDefaults.standard.array(forKey: "fence.cam.\(lens.rawValue)") as? [[Double]] {
+            fenceCam = arr.compactMap { $0.count == 2 ? CGPoint(x: $0[0], y: $0[1]) : nil }
+        } else {
+            fenceCam = []
+        }
+        loadingFence = false
+        updateFenceLaser()
+    }
+
+    private func saveLimits() {
+        UserDefaults.standard.set(limits.map { [Double($0.x), Double($0.y)] }, forKey: "laser.limits")
+    }
+
+    private func loadLimits() {
+        if let arr = UserDefaults.standard.array(forKey: "laser.limits") as? [[Double]] {
+            limits = arr.compactMap { $0.count == 2 ? CGPoint(x: $0[0], y: $0[1]) : nil }
         }
     }
 }
@@ -358,50 +487,62 @@ enum DotDetector {
         let strength: Int
     }
 
-    /// Finds the laser dot as the strongest red-channel increase between "on" frames and the "off" background.
-    static func detect(on frames: [RedFrame], off: RedFrame, minStrength: Int = 35) -> Result? {
-        guard let first = frames.first else { return nil }
-        let w = first.width, h = first.height
-        guard off.width == w, off.height == h else { return nil }
-        let n = w * h
+    static let minStrength = 10
 
-        // Use the per-pixel minimum of the "on" frames to suppress transient motion.
-        var diff = [Int16](repeating: 0, count: n)
-        for i in 0..<n {
-            var v = Int(first.data[i])
-            for f in frames.dropFirst() where f.data.count == n { v = min(v, Int(f.data[i])) }
-            diff[i] = Int16(v - Int(off.data[i]))
+    /// Finds the laser dot as the strongest compact increase of "redness" between `on` (dot here)
+    /// and `ref` (dot somewhere else). Peak is evaluated on 3×3 means to ignore single noisy pixels.
+    static func detect(on: RedFrame, ref: RedFrame, roi: CGRect) -> Result? {
+        let w = on.width, h = on.height
+        guard ref.width == w, ref.height == h, w > 4, h > 4 else { return nil }
+        let x0 = max(1, Int(roi.minX * CGFloat(w))), x1 = min(w - 2, Int(roi.maxX * CGFloat(w)))
+        let y0 = max(1, Int(roi.minY * CGFloat(h))), y1 = min(h - 2, Int(roi.maxY * CGFloat(h)))
+        guard x1 > x0, y1 > y0 else { return nil }
+
+        var bestMean = 0
+        var bestX = 0, bestY = 0
+        let pre = minStrength / 2
+        on.data.withUnsafeBufferPointer { a in
+            ref.data.withUnsafeBufferPointer { b in
+                for y in y0...y1 {
+                    let row = y * w
+                    for x in x0...x1 {
+                        let i = row + x
+                        if Int(a[i]) - Int(b[i]) <= pre { continue }
+                        var s = 0
+                        for dy in -1...1 {
+                            let r = i + dy * w
+                            s += Int(a[r - 1]) - Int(b[r - 1]) + Int(a[r]) - Int(b[r]) + Int(a[r + 1]) - Int(b[r + 1])
+                        }
+                        let mean = s / 9
+                        if mean > bestMean {
+                            bestMean = mean
+                            bestX = x
+                            bestY = y
+                        }
+                    }
+                }
+            }
         }
+        guard bestMean >= minStrength else { return nil }
 
-        var maxV: Int16 = 0
-        var maxI = 0
-        for i in 0..<n where diff[i] > maxV {
-            maxV = diff[i]
-            maxI = i
-        }
-        guard Int(maxV) >= minStrength else { return nil }
-
-        let mx = maxI % w, my = maxI / w
-        let r = 14
-        let thr = Int16(Double(maxV) * 0.5)
+        // Weighted centroid of the blob around the peak + compactness check.
+        let rad = 24
+        let thr = max(pre, bestMean / 2)
         var sx = 0.0, sy = 0.0, sw = 0.0
         var count = 0
-        for y in max(0, my - r)...min(h - 1, my + r) {
-            for x in max(0, mx - r)...min(w - 1, mx + r) {
-                let v = diff[y * w + x]
+        for y in max(0, bestY - rad)...min(h - 1, bestY + rad) {
+            for x in max(0, bestX - rad)...min(w - 1, bestX + rad) {
+                let v = Int(on.data[y * w + x]) - Int(ref.data[y * w + x])
                 if v >= thr {
-                    let wt = Double(v)
-                    sx += Double(x) * wt
-                    sy += Double(y) * wt
-                    sw += wt
+                    sx += Double(x) * Double(v)
+                    sy += Double(y) * Double(v)
+                    sw += Double(v)
                     count += 1
                 }
             }
         }
-        // A real dot is small and compact – reject large blobs (lighting change, moving object).
-        guard sw > 0, count < 250 else { return nil }
-        let cx = (sx / sw + 0.5) / Double(w)
-        let cy = (sy / sw + 0.5) / Double(h)
-        return Result(point: CGPoint(x: cx, y: cy), strength: Int(maxV))
+        guard sw > 0, count >= 2, count < 1200 else { return nil }
+        return Result(point: CGPoint(x: (sx / sw + 0.5) / Double(w), y: (sy / sw + 0.5) / Double(h)),
+                      strength: bestMean)
     }
 }

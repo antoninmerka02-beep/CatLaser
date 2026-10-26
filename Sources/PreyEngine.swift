@@ -2,15 +2,26 @@ import Foundation
 import CoreGraphics
 import QuartzCore
 
-/// Moves the laser dot like prey: lures the cat, flees, freezes, hides, lets itself be caught.
+private func storedDouble(_ key: String, _ def: Double) -> Double {
+    UserDefaults.standard.object(forKey: key) as? Double ?? def
+}
+
+private func storedBool(_ key: String, _ def: Bool) -> Bool {
+    UserDefaults.standard.object(forKey: key) as? Bool ?? def
+}
+
+/// Moves the laser dot like prey: lures, flees, freezes, dashes away, lets itself be caught.
+/// The laser is never switched off during play (it runs a ~5 s intro animation after every power-on),
+/// except when the target leaves the view and the safety option asks for it.
 final class PreyEngine: ObservableObject {
     enum Mode: String {
         case off = "Vypnuto"
-        case waiting = "Čekám na kočku"
+        case warmup = "Laser se zapíná…"
+        case waiting = "Čekám na cíl"
         case lure = "Láká"
         case flee = "Utíká"
         case freeze = "Zamrzla"
-        case hide = "Schovala se"
+        case dash = "Prchá"
         case letCatch = "Nechá se chytit"
         case caught = "Chycena!"
         case ending = "Konec hry"
@@ -18,6 +29,8 @@ final class PreyEngine: ObservableObject {
 
     // MARK: Published state
     @Published private(set) var running = false
+    @Published private(set) var preparing = false
+    @Published private(set) var countdown = 0
     @Published private(set) var mode: Mode = .off
     @Published private(set) var escapes = 0
     @Published private(set) var catches = 0
@@ -25,57 +38,119 @@ final class PreyEngine: ObservableObject {
     @Published private(set) var dot = CGPoint(x: 200, y: 200)
     @Published var message = ""
 
-    // MARK: Settings (persisted)
-    @Published var intensity: Double = UserDefaults.standard.object(forKey: "prey.intensity") as? Double ?? 0.6 {
+    // MARK: Game settings (persisted)
+    @Published var intensity = storedDouble("prey.intensity", 0.6) {
         didSet { UserDefaults.standard.set(intensity, forKey: "prey.intensity") }
     }
-    @Published var sessionMinutes: Double = UserDefaults.standard.object(forKey: "prey.minutes") as? Double ?? 5 {
+    @Published var sessionMinutes = storedDouble("prey.minutes", 5) {
         didSet { UserDefaults.standard.set(sessionMinutes, forKey: "prey.minutes") }
     }
     /// Average number of escapes before the dot lets itself be caught.
-    @Published var catchEvery: Double = UserDefaults.standard.object(forKey: "prey.catchEvery") as? Double ?? 4 {
+    @Published var catchEvery = storedDouble("prey.catchEvery", 4) {
         didSet { UserDefaults.standard.set(catchEvery, forKey: "prey.catchEvery") }
     }
-    /// Never put the dot onto the cat.
-    @Published var avoidCat: Bool = UserDefaults.standard.object(forKey: "prey.avoidCat") as? Bool ?? true {
+    /// Keep the dot off the target.
+    @Published var avoidCat = storedBool("prey.avoidCat", true) {
         didSet { UserDefaults.standard.set(avoidCat, forKey: "prey.avoidCat") }
     }
-    /// Switch the laser off when the cat leaves the view.
-    @Published var autoOffWhenLost: Bool = UserDefaults.standard.object(forKey: "prey.autoOff") as? Bool ?? true {
+    /// Switch the laser off when the target leaves the view.
+    @Published var autoOffWhenLost = storedBool("prey.autoOff", true) {
         didSet { UserDefaults.standard.set(autoOffWhenLost, forKey: "prey.autoOff") }
+    }
+
+    // MARK: Start-sequence settings (persisted)
+    @Published var countdownSeconds = storedDouble("start.countdown", 5) {
+        didSet { UserDefaults.standard.set(countdownSeconds, forKey: "start.countdown") }
+    }
+    @Published var calibrateBeforeGame = storedBool("start.calibrate", true) {
+        didSet { UserDefaults.standard.set(calibrateBeforeGame, forKey: "start.calibrate") }
+    }
+    /// Length of the laser's own intro animation after power-on.
+    @Published var warmupSeconds = storedDouble("laser.warmup", 5.5) {
+        didSet { UserDefaults.standard.set(warmupSeconds, forKey: "laser.warmup") }
+    }
+    /// Wait at each calibration point before taking frames.
+    @Published var settleSeconds = storedDouble("calib.settle", 1.5) {
+        didSet { UserDefaults.standard.set(settleSeconds, forKey: "calib.settle") }
+    }
+    /// Exposure bias during calibration (EV). Negative = darker, helps in bright rooms.
+    @Published var exposureBias = storedDouble("calib.exposure", -1.5) {
+        didSet { UserDefaults.standard.set(exposureBias, forKey: "calib.exposure") }
     }
 
     private let laser: LaserController
     private let field: FieldModel
+    private let camera: CameraManager
 
     private var timer: Timer?
+    private var flowCancelled = false
     private var lastTick: CFTimeInterval = 0
     private var endTime: CFTimeInterval = 0
     private var modeStart: CFTimeInterval = 0
     private var modeDuration: Double = 0
+    private var warmupUntil: CFTimeInterval = 0
+    private var modeAfterWarmup: Mode = .waiting
     private var p = CGPoint(x: 200, y: 200)
     private var lastSent = CGPoint(x: -100, y: -100)
-    private var laserWanted = false
     private var lastCatSeen: CFTimeInterval = 0
     private var lureDir = CGPoint(x: 1, y: 0)
     private var tangentSign: CGFloat = 1
     private var nextCatchAt = 4
-    private var hideTarget = CGPoint(x: 200, y: 200)
+    private var dashTarget = CGPoint(x: 200, y: 200)
     private var wanderTarget = CGPoint(x: 200, y: 200)
 
     private let lostTimeout: Double = 2.5
 
-    init(laser: LaserController, field: FieldModel) {
+    init(laser: LaserController, field: FieldModel, camera: CameraManager) {
         self.laser = laser
         self.field = field
+        self.camera = camera
     }
 
-    // MARK: - Control
+    // MARK: - Start sequence: countdown → calibration → game
 
-    func start() {
-        guard laser.isReady else { message = "Laser není připojený (záložka Test)."; return }
-        guard field.isCalibrated else { message = "Nejdřív proveď kalibraci."; return }
+    @MainActor
+    func startFlow() async {
+        guard laser.isReady else { message = "Laser není připojený."; return }
+        guard !running && !preparing else { return }
         message = ""
+        flowCancelled = false
+        preparing = true
+        defer {
+            preparing = false
+            countdown = 0
+        }
+
+        var n = Int(countdownSeconds.rounded())
+        while n > 0 {
+            countdown = n
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            if flowCancelled { message = "Start zrušen."; return }
+            n -= 1
+        }
+        countdown = 0
+
+        if calibrateBeforeGame || !field.isCalibrated {
+            let ok = await field.calibrate(laser: laser, camera: camera, settle: settleSeconds,
+                                           warmup: warmupSeconds, exposureBias: Float(exposureBias))
+            if flowCancelled { message = "Start zrušen."; return }
+            guard ok else {
+                message = field.calibrationStatus
+                return
+            }
+        }
+        start()
+    }
+
+    func cancelFlow() {
+        flowCancelled = true
+        field.cancelRequested = true
+    }
+
+    /// Starts the game immediately with the current calibration.
+    func start() {
+        guard laser.isReady else { message = "Laser není připojený."; return }
+        guard field.isCalibrated else { message = "Chybí kalibrace."; return }
         laser.pattern = .none
         if laser.preset != 0 { laser.setPreset(0) }
         escapes = 0
@@ -83,13 +158,14 @@ final class PreyEngine: ObservableObject {
         scheduleNextCatch()
         p = field.constrain(field.playCenter)
         lastSent = CGPoint(x: -100, y: -100)
-        laserWanted = false
         lastCatSeen = 0
         endTime = CACurrentMediaTime() + sessionMinutes * 60
         remaining = sessionMinutes * 60
         running = true
+        camera.refreshDetectionSettings()
         setMode(.waiting)
-        laser.addLog("Hra: start (\(Int(sessionMinutes)) min, intenzita \(Int(intensity * 100)) %)")
+        if !laser.laserOn { turnLaserOn(thenMode: .waiting) }
+        laser.addLog("Hra: start (\(Int(sessionMinutes)) min, intenzita \(Int(intensity * 100)) %, cíl \(camera.target.title))")
         lastTick = CACurrentMediaTime()
         let t = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(t, forMode: .common)
@@ -97,11 +173,14 @@ final class PreyEngine: ObservableObject {
     }
 
     func stop(reason: String = "zastaveno") {
+        cancelFlow()
         timer?.invalidate()
         timer = nil
-        if running { laser.addLog("Hra: konec (\(reason)), útěků \(escapes), chycení \(catches)") }
+        if running {
+            laser.addLog("Hra: konec (\(reason)), útěků \(escapes), chycení \(catches)")
+            if laser.isReady && laser.laserOn { laser.setLaser(false) }
+        }
         running = false
-        setLaserWanted(false)
         mode = .off
     }
 
@@ -119,12 +198,17 @@ final class PreyEngine: ObservableObject {
         }
 
         remaining = max(0, endTime - now)
-        if remaining == 0 && mode != .ending && mode != .caught {
-            setMode(.ending)
-            laser.addLog("Hra: čas vypršel – tečka se nechá chytit a zhasne")
+
+        // Laser intro animation after power-on – don't send moves, it would fight the animation.
+        if mode == .warmup {
+            if now >= warmupUntil { setMode(modeAfterWarmup) } else { return }
         }
 
-        // Cat state (with prediction for system latency)
+        if remaining == 0 && mode != .ending && mode != .caught {
+            setMode(.ending)
+            laser.addLog("Hra: čas vypršel – tečka se nechá chytit")
+        }
+
         var cat: CatState?
         if let c = field.cat, now - c.time < lostTimeout {
             cat = c
@@ -136,32 +220,35 @@ final class PreyEngine: ObservableObject {
             return
         }
 
+        if !laser.laserOn {
+            turnLaserOn(thenMode: .lure)
+            return
+        }
+
+        let s = max(25, c.size)
+        let fleeTrigger = s * CGFloat(2.0 + 0.8 * intensity)
+
         if mode == .waiting {
             setMode(.lure)
             lureDir = (field.playCenter - c.position).normalized
             if lureDir == .zero { lureDir = CGPoint(x: 1, y: 0) }
-            p = field.constrain(c.position + lureDir * (max(25, c.size) * 3.8))
         }
 
         let lead = CGFloat(min(0.5, (now - c.time) + laser.estimatedLatency + 0.08))
         let catPos = c.position + c.velocity * lead
-        let s = max(25, c.size)
         let toDot = p - catPos
         let d = toDot.length
         let dirAway = d > 1 ? toDot * (1 / d) : lureDir
-        let approach = c.velocity.dot(dirAway) // > 0 = cat moving towards the dot
+        let approach = c.velocity.dot(dirAway) // > 0 = target moving towards the dot
 
         let maxSpeed = CGFloat(120 + 480 * intensity)
         let lureSpeed = maxSpeed * 0.35
-        let fleeTrigger = s * CGFloat(2.0 + 0.8 * intensity)
         let safeDist = s * 4.5
         let catchRadius = s * 0.75
         let elapsed = now - modeStart
 
-        var showLaser = true
-
         switch mode {
-        case .off, .waiting:
+        case .off, .waiting, .warmup:
             break
 
         case .lure:
@@ -197,8 +284,8 @@ final class PreyEngine: ObservableObject {
                 escapes += 1
                 let r = Double.random(in: 0..<1)
                 if r < 0.15 {
-                    hideTarget = field.randomPoint(farFrom: catPos)
-                    setMode(.hide, duration: Double.random(in: 0.6...1.4))
+                    dashTarget = field.randomPoint(farFrom: catPos)
+                    setMode(.dash)
                 } else if r < 0.5 {
                     setMode(.freeze, duration: Double.random(in: 0.6...1.8))
                 } else {
@@ -215,15 +302,13 @@ final class PreyEngine: ObservableObject {
                 setMode(.lure)
             }
 
-        case .hide:
-            showLaser = false
-            moveTowards(hideTarget, speed: maxSpeed * 1.5, dt: dt)
-            if elapsed > modeDuration {
-                setMode(.freeze, duration: Double.random(in: 0.3...0.8))
+        case .dash:
+            moveTowards(dashTarget, speed: maxSpeed * 1.6, dt: dt)
+            if p.distance(to: dashTarget) < 4 || elapsed > 2 {
+                setMode(.freeze, duration: Double.random(in: 0.4...1.0))
             }
 
         case .letCatch, .ending:
-            // Slow down and wait for the cat to pounce.
             let slow = mode == .ending ? lureSpeed * 0.3 : lureSpeed * 0.4
             let target = catPos + dirAway * (s * 0.9)
             moveTowards(target, speed: slow, dt: dt)
@@ -231,7 +316,7 @@ final class PreyEngine: ObservableObject {
                 catches += 1
                 setMode(.caught, duration: Double.random(in: 1.2...2.0))
             } else if mode == .letCatch && elapsed > 6 {
-                scheduleNextCatch() // cat not interested – try again later
+                scheduleNextCatch() // not interested – try again later
                 setMode(.lure)
             } else if mode == .ending && elapsed > 12 {
                 finish()
@@ -239,35 +324,21 @@ final class PreyEngine: ObservableObject {
             }
 
         case .caught:
-            // "Caught under the paw": with the cat-safety on, the dot disappears instead of shining on the cat.
-            showLaser = !avoidCat
+            // Stay still "under the paw" (with the safety on: just in front of it).
             if elapsed > modeDuration {
                 if remaining == 0 {
                     finish()
                     return
                 }
                 scheduleNextCatch()
-                p = field.constrain(catPos + lureDir * (s * 1.5))
                 startFlee()
             }
         }
 
-        // Safety: never put the dot onto the cat.
-        if avoidCat && showLaser {
+        if avoidCat {
             p = keepOffCat(p, cat: c, catPos: catPos, s: s)
         }
-
         p = field.constrain(p)
-
-        // If the fence pushed the dot back onto the cat (cat in a corner), hide it rather than shine on the cat.
-        if avoidCat && showLaser {
-            let poly = c.polygon.map { $0 + (catPos - c.position) }
-            if (poly.count >= 3 && Poly.contains(poly, p)) || p.distance(to: catPos) < s * 0.3 {
-                showLaser = false
-            }
-        }
-
-        setLaserWanted(showLaser)
         sendIfMoved()
     }
 
@@ -278,25 +349,35 @@ final class PreyEngine: ObservableObject {
             return
         }
         if autoOffWhenLost {
-            if mode != .waiting {
-                laser.addLog("Hra: kočka zmizela ze záběru – laser vypnut")
-                setMode(.waiting)
+            if lostFor > lostTimeout && laser.laserOn {
+                laser.addLog("Hra: cíl zmizel ze záběru – laser vypnut")
+                laser.setLaser(false)
             }
-            setLaserWanted(false)
+            if mode != .waiting { setMode(.waiting) }
             return
         }
-        // Safety off: wander slowly to attract the cat.
-        if mode != .waiting && lostFor > lostTimeout { setMode(.waiting) }
+        // Safety off: wander slowly to attract the cat back.
+        if mode != .waiting { setMode(.waiting) }
+        if !laser.laserOn {
+            turnLaserOn(thenMode: .waiting)
+            return
+        }
         if p.distance(to: wanderTarget) < 10 {
             wanderTarget = field.randomPoint(farFrom: p)
         }
         moveTowards(wanderTarget, speed: CGFloat(60 + 120 * intensity), dt: dt)
-        p = field.constrain(p)
-        setLaserWanted(true)
         sendIfMoved()
     }
 
     // MARK: - Helpers
+
+    private func turnLaserOn(thenMode m: Mode) {
+        laser.setLaser(true)
+        warmupUntil = CACurrentMediaTime() + warmupSeconds
+        modeAfterWarmup = m
+        setMode(.warmup)
+        lastSent = CGPoint(x: -100, y: -100) // re-send position after the intro
+    }
 
     private func startFlee() {
         tangentSign = Bool.random() ? 1 : -1
@@ -346,14 +427,6 @@ final class PreyEngine: ObservableObject {
             q = catPos + dir * minDist
         }
         return q
-    }
-
-    private func setLaserWanted(_ on: Bool) {
-        guard on != laserWanted || on != laser.laserOn else { return }
-        laserWanted = on
-        if laser.isReady && laser.laserOn != on {
-            laser.setLaser(on)
-        }
     }
 
     private func sendIfMoved() {

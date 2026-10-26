@@ -176,6 +176,8 @@ struct PadCard: View {
 
 struct LaserPad: View {
     @EnvironmentObject var laser: LaserController
+    /// Optional polygon (laser coordinates) drawn on the pad, e.g. the laser limits.
+    var polygon: [CGPoint] = []
 
     var body: some View {
         GeometryReader { geo in
@@ -190,6 +192,21 @@ struct LaserPad: View {
                     p.addLine(to: CGPoint(x: side, y: side / 2))
                 }
                 .stroke(Color.secondary.opacity(0.35), lineWidth: 1)
+                if polygon.count >= 2 {
+                    Path { p in
+                        p.addLines(polygon.map { CGPoint(x: $0.x / 400 * side, y: $0.y / 400 * side) })
+                        if polygon.count >= 3 { p.closeSubpath() }
+                    }
+                    .stroke(Color.orange, style: StrokeStyle(lineWidth: 2, dash: [5, 3]))
+                    ForEach(Array(polygon.enumerated()), id: \.offset) { i, pt in
+                        Text("\(i + 1)")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.white)
+                            .frame(width: 16, height: 16)
+                            .background(Circle().fill(Color.orange))
+                            .position(x: pt.x / 400 * side, y: pt.y / 400 * side)
+                    }
+                }
                 Circle()
                     .fill(Color.red)
                     .frame(width: 20, height: 20)

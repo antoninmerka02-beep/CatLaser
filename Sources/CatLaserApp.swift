@@ -8,7 +8,7 @@ final class AppModel: ObservableObject {
 
     init() {
         field = FieldModel(camera: camera)
-        engine = PreyEngine(laser: laser, field: field)
+        engine = PreyEngine(laser: laser, field: field, camera: camera)
     }
 }
 

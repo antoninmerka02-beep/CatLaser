@@ -1,5 +1,17 @@
 # CatLaser – laserová kořist pro kočku (Tesla Smart Laser Dot)
 
+## v0.3
+
+- postup: 1 · limity laseru (rohy nastavené tečkou na padu, laser nikdy nevyjede ven) → 2 · hřiště nakreslené
+  do obrazu kamery → 3 · nastavení hry → 4 · Start = odpočet (nesahat na telefon) → kalibrace → hra hned začne
+- kalibrace bez vypínání laseru (laser po zapnutí ~5 s dělá úvodní kolečko): tečka se hledá jako rozdíl snímků
+  mezi sousedními body, výsledek se přijme jen když souhlasí porovnání s oběma sousedy
+- detekce tečky: „červenost“ (2R−G−B)/2 v plném rozlišení, průměr 3 snímků, snížená a zamčená expozice,
+  zamčené vyvážení bílé, hledání jen v okolí hřiště; nastavitelné čekání na bod a expozice
+- během hry se laser nevypíná (schování nahrazeno rychlým úprkem), po zapnutí se čeká na úvodní kolečko
+- cíl: Kočka / Člověk (nohy) – testovací režim bez kočky
+- objektiv „1× + LiDAR“: detekce čehokoli, co stojí na podlaze, podle hloubky (naučené prázdné podlahy)
+
 ## v0.2 – záložka Hra
 
 - živý náhled kamery (přepínač Širokoúhlý 0,5× / Standardní 1×, každý má vlastní kalibraci)
