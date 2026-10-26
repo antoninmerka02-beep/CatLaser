@@ -199,6 +199,16 @@ final class LaserController: NSObject, ObservableObject {
 
     func centre() { userMove(x: 200, y: 200) }
 
+    /// Move requested by the game / calibration (does not touch test patterns).
+    func gameMove(x: Int, y: Int) {
+        queueMove(x: x, y: y)
+    }
+
+    /// Estimated one-way command latency in seconds (half of the average ack round trip, min 40 ms).
+    var estimatedLatency: Double {
+        max(0.04, (avgRtt ?? 80) / 2000)
+    }
+
     func resetStats() {
         rttSamples = []
         lastRtt = nil

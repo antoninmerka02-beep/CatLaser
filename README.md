@@ -1,6 +1,21 @@
-# CatLaser – test ovládání Tesla Smart Laser Dot přes Bluetooth
+# CatLaser – laserová kořist pro kočku (Tesla Smart Laser Dot)
 
-Testovací iOS aplikace, která se k laseru (Tuya BLE, model TSL-PC-PTY010) připojí napřímo,
+## v0.2 – záložka Hra
+
+- živý náhled kamery (přepínač Širokoúhlý 0,5× / Standardní 1×, každý má vlastní kalibraci)
+- automatická kalibrace: laser projede 16 bodů, kamera najde tečku (rozdíl snímků laser zap/vyp),
+  spočítá se homografie podlahy kamera → laser a dosažitelná oblast (modrá čárkovaná)
+- ohraničení hřiště („digital fence“): klepnutím do obrazu přidáváš rohy, tažením je posouváš;
+  tečka nikdy nevyjede ze žluté oblasti (ukládá se v souřadnicích laseru, platí pro oba objektivy)
+- sledování kočky přes Vision (VNRecognizeAnimalsRequest, ~12×/s), pozice = spodní okraj rámečku (tlapky)
+- logika kořisti: láká → utíká (rychlost podle blízkosti kočky, uhýbá od okrajů) → zamrzne / schová se
+  → po ~N útěcích se nechá chytit → na konci hry se nechá chytit a zhasne
+- pojistky (lze vypnout): „Nesvítit na kočku“ a „Vypnout laser, když kočka zmizí“
+- nastavení: intenzita, délka hry, jak často se nechá chytit, citlivost detekce
+
+## v0.1 – záložka Test
+
+Testovací obrazovka, která se k laseru (Tuya BLE, model TSL-PC-PTY010) připojí napřímo,
 bez Smart Life / Tesla aplikace, a ovládá ho:
 
 - zapnutí / vypnutí laseru (DP 105)

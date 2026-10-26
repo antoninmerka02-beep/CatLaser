@@ -6,8 +6,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.1"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.2"
+    CURRENT_PROJECT_VERSION: "2"
 targets:
   CatLaser:
     type: application
@@ -26,6 +26,7 @@ targets:
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
         NSBluetoothAlwaysUsageDescription: "CatLaser se přes Bluetooth připojuje k laserové hračce a ovládá ji."
+        NSCameraUsageDescription: "Kamera sleduje kočku a laserovou tečku, aby tečka mohla utíkat."
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: cz.merka.catlaser
